@@ -1,153 +1,141 @@
-"""
-Telegram MenuPlanner Bot (Ready-to-Deploy, Dynamisch Aantal Menu's)
------------------------------------------------------------------
-
-Features:
-- Spraak naar tekst via OpenAI Whisper
-- Menu's genereren via ChatGPT
-- Dynamisch aantal menu's gebaseerd op gebruikersinput
-- Geschikt voor gezin van 2 volwassenen + 2 kinderen
-- Klaar voor Render.com Free Tier
-
-Dependencies (requirements.txt):
-- python-telegram-bot==20.5
-- requests
-- python-dotenv
-- openai
-- pydub
-- ffmpeg geïnstalleerd (Linux: sudo apt install ffmpeg, Mac: brew install ffmpeg)
-
-Environment variables:
-- TELEGRAM_TOKEN = <je Telegram bot token>
-- OPENAI_API_KEY = <je OpenAI API key>
-"""
-
 import os
 import logging
 import tempfile
-import re
-from dotenv import load_dotenv
-from telegram import Update, InputFile
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 from pydub import AudioSegment
-import openai
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from openai import OpenAI
 
-# Load environment variables
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
+# -----------------------------
+# Setup
+# -----------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
-if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
-    raise RuntimeError("Zet TELEGRAM_TOKEN en OPENAI_API_KEY in je omgevingsvariabelen")
-
-# Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Convert OGG to WAV
-def convert_ogg_to_wav(input_path):
-    audio = AudioSegment.from_ogg(input_path)
-    output_path = input_path.replace('.ogg', '.wav')
-    audio.export(output_path, format="wav")
-    return output_path
+# Environment vars
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Transcribe audio via OpenAI Whisper
-def transcribe_audio(filepath):
-    wav_path = convert_ogg_to_wav(filepath)
-    with open(wav_path, 'rb') as f:
-        transcript = openai.Audio.transcriptions.create(model="whisper-1", file=f)
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+
+async def transcribe_audio(file_path: str) -> str:
+    """Transcribe an audio file using Whisper (OpenAI)."""
+    with open(file_path, "rb") as audio_file:
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file
+        )
     return transcript.text
 
-# Extract number of menus from user input
-def extract_number_of_menus(text):
-    match = re.search(r'\b(\d+)\b', text)
-    if match:
-        return int(match.group(1))
-    return 3  # standaard als geen getal gevonden wordt
 
-# Generate menus via ChatGPT with dynamic number
-def call_openai_chat_dynamic(prompt_text):
-    num_menus = extract_number_of_menus(prompt_text)
-    system_msg = (
-        f"Je bent een slimme weekmenu-planner. Gebruik de huidige aanbiedingen op "
-        f"https://www.jumbo.com/acties/weekaanbiedingen om {num_menus} menu's samen te stellen "
-        f"voor een gezin van 2 volwassenen en 2 kinderen (ongeveer 3 volwassen porties). "
-        f"Geef per menu: naam, boodschappenlijst met hoeveelheden en geschatte prijzen, en een korte bereidingswijze."
-    )
-    response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt_text}
-        ],
-        temperature=0.4,
-        max_tokens=1000
-    )
-    return response.choices[0].message.content
+async def generate_menus(prompt_text: str) -> str:
+    """Send user prompt to ChatGPT and return the answer."""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Je bent een behulpzame kookassistent die weekmenu's maakt op basis van aanbiedingen."},
+                {"role": "user", "content": prompt_text}
+            ],
+            temperature=0.7
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Fout bij aanroepen ChatGPT: {e}")
+        return "Er ging iets mis bij het genereren van de menu's."
 
-# Telegram Handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hallo! Stuur me een spraakbericht met je verzoek, bijvoorbeeld: 'Geef mij 3 weekmenu's voor mijn gezin op basis van de aanbiedingen van deze week.'"
-    )
+
+# -----------------------------
+# Telegram handlers
+# -----------------------------
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user = msg.from_user
-    logger.info("Received voice from %s (%s)", user.full_name, user.id)
-
-    voice = msg.voice
-    if not voice:
-        await msg.reply_text("Geen audio gevonden in het bericht.")
-        return
-
-    # Download OGG bestand
-    file = await context.bot.get_file(voice.file_id)
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tf:
-        temp_path = tf.name
-        await file.download_to_drive(custom_path=temp_path)
-
-    await msg.reply_text("Audio ontvangen, ik transcribeer het nu...")
-
+    """Ontvang spraakbericht, transcribeer en genereer weekmenu."""
     try:
-        transcript = transcribe_audio(temp_path)
-        logger.info("Transcriptie: %s", transcript)
-        await msg.reply_text(f"Transcriptie:\n{transcript}\n\nIk ga nu menu's samenstellen...")
+        user = update.effective_user.first_name
+        voice = update.message.voice
 
-        response_text = call_openai_chat_dynamic(transcript)
+        logger.info(f"Ontvangen spraakbericht van {user}")
 
-        # Stuur terug, splitsen als te lang
-        if len(response_text) > 3500:
-            with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as out:
-                out.write(response_text)
-                out.flush()
-                await msg.reply_document(document=InputFile(out.name), filename="menu_planner_output.txt")
-        else:
-            await msg.reply_text(response_text)
+        # Download voice file
+        file = await context.bot.get_file(voice.file_id)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
+            await file.download_to_drive(f.name)
+            ogg_path = f.name
+
+        # Converteer naar WAV (Whisper werkt beter met .wav)
+        wav_path = ogg_path.replace(".ogg", ".wav")
+        AudioSegment.from_file(ogg_path).export(wav_path, format="wav")
+
+        # Transcribeer
+        await update.message.reply_text("Momentje, ik luister even naar je bericht… 🎧")
+        text = await transcribe_audio(wav_path)
+        logger.info(f"Transcriptie: {text}")
+
+        # Maak prompt
+        prompt = (
+            f"De gebruiker zei: '{text}'. "
+            "Gebruik dit als context om weekmenu's te maken op basis van de huidige aanbiedingen. "
+            "Reken voor 3 volwassen personen, geef voor elk menu ook een korte bereiding."
+        )
+
+        # Genereer antwoord
+        await update.message.reply_text("Dank je! Ik stel de menu’s samen… 🍽️")
+        answer = await generate_menus(prompt)
+
+        # Verstuur antwoord
+        await update.message.reply_text(answer)
+
+        # Ruim tijdelijke bestanden op
+        os.remove(ogg_path)
+        os.remove(wav_path)
 
     except Exception as e:
-        logger.exception("Fout tijdens verwerking: %s", e)
-        await msg.reply_text("Er is iets misgegaan tijdens de verwerking. Controleer de logs.")
+        logger.error(f"Fout in voice handler: {e}")
+        await update.message.reply_text("Er ging iets mis bij het verwerken van je bericht 😞")
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    await update.message.reply_text("Oké, ik maak de menu's — even geduld...")
-    try:
-        response_text = call_openai_chat_dynamic(text)
-        await update.message.reply_text(response_text)
-    except Exception as e:
-        logger.exception("Chat call failed: %s", e)
-        await update.message.reply_text("Kon de menu's niet genereren — zie logs.")
+    """Verwerk tekstberichten (zelfde logica als spraak)."""
+    user_input = update.message.text
+    logger.info(f"Tekstbericht ontvangen: {user_input}")
+
+    prompt = (
+        f"De gebruiker zei: '{user_input}'. "
+        "Gebruik dit als context om weekmenu's te maken op basis van de huidige aanbiedingen. "
+        "Reken voor 3 volwassen personen, geef voor elk menu ook een korte bereiding."
+    )
+
+    await update.message.reply_text("Momentje, ik stel de menu’s samen… 🍽️")
+    answer = await generate_menus(prompt)
+    await update.message.reply_text(answer)
+
+
+# -----------------------------
+# Main
+# -----------------------------
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    if not TELEGRAM_TOKEN or not OPENAI_API_KEY:
+        raise ValueError("TELEGRAM_TOKEN en OPENAI_API_KEY moeten als environment variables gezet zijn.")
 
-    logger.info("Bot gestart...")
+    logger.info("Bot wordt gestart...")
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     app.run_polling()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
