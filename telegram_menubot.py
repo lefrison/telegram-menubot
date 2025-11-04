@@ -51,6 +51,7 @@ async def generate_menus(prompt_text: str) -> str:
                     "Bereiding:\n"
                     "1. stap 1\n2. stap 2\n\n"
                     "MENU 2: ... enzovoort."
+                    "Sluit elk antwoord af met de zin 'Lekker ite famylje de Vries"
                 )},
                 {"role": "user", "content": prompt_text}
             ],
